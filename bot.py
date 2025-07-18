@@ -1,105 +1,135 @@
-from flask import Flask, request, jsonify
 import os
-import requests
+import time
 import hmac
 import hashlib
-import time
+import requests
+from flask import Flask, request, jsonify
+import threading
 
 app = Flask(__name__)
 
-# === Nastavení proměnných ===
-API_KEY = os.environ.get("MEXC_API_KEY")
-API_SECRET = os.environ.get("MEXC_API_SECRET")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# === ENV proměnné ===
+MEXC_API_KEY = os.environ.get("MEXC_API_KEY")
+MEXC_API_SECRET = os.environ.get("MEXC_API_SECRET")
+LEVERAGE = int(os.environ.get("MEXC_LEVERAGE", 15))
+SYMBOL = os.environ.get("MEXC_SYMBOL", "BTC_USDT")
+SL_PERCENT = float(os.environ.get("SL_PERCENT", 10))
+TG_BOT = os.environ.get("TG_BOT")
+TG_CHAT = os.environ.get("TG_CHAT")
+TRAIL_PERCENT = float(os.environ.get("TRAIL_PERCENT", "0.5").replace(",", "."))
 
-SYMBOL = "BTCUSDT"
-LEVERAGE = 15
-ORDER_TYPE = 1  # 1 = market
-PERCENT_BALANCE = 10  # % kapitálu
-
-# === Zjisti zůstatek na futures účtu ===
-def get_balance():
-    timestamp = str(int(time.time() * 1000))
-    query = f"timestamp={timestamp}"
-    signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-    headers = {"X-MEXC-API-KEY": API_KEY}
-    url = f"https://contract.mexc.com/api/v1/private/account/assets?{query}&signature={signature}"
-    response = requests.get(url, headers=headers)
-    data = response.json()
-    for asset in data.get("data", []):
-        if asset["currency"] == "USDT":
-            return float(asset["availableBalance"])
-    return 0
-
-# === Vypočítej pozici podle procenta kapitálu ===
-def calculate_position(balance, price):
-    usdt_amount = (balance * PERCENT_BALANCE) / 100
-    quantity = round((usdt_amount * LEVERAGE) / price, 3)
-    return quantity
-
-# === Otevři obchod ===
-def place_order(side):
-    balance = get_balance()
-    price = float(get_price())
-    quantity = calculate_position(balance, price)
-    timestamp = str(int(time.time() * 1000))
-
-    body = {
-        "symbol": SYMBOL,
-        "price": str(price),
-        "vol": str(quantity),
-        "leverage": LEVERAGE,
-        "side": 1 if side == "buy" else 2,
-        "type": ORDER_TYPE,
-        "open_type": "isolated",
-        "position_id": 0,
-        "external_oid": f"order_{timestamp}",
-        "stop_loss_price": round(price * 0.90, 2),
-        "take_profit_price": round(price * 1.015, 2),
-        "position_mode": "single",
-        "reduce_only": False
-    }
-
-    query = f"timestamp={timestamp}"
-    signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "Content-Type": "application/json",
-        "X-MEXC-API-KEY": API_KEY
-    }
-
-    url = f"https://contract.mexc.com/api/v1/private/order/submit?{query}&signature={signature}"
-    response = requests.post(url, headers=headers, json=body)
-    notify_telegram(f"Obchod: {side.upper()} {quantity} BTC @ {price}\nOdpověď: {response.text}")
-    return response.text
-
-# === Získej aktuální cenu ===
-def get_price():
-    url = f"https://contract.mexc.com/api/v1/contract/market/depth?symbol={SYMBOL}&limit=5"
-    response = requests.get(url).json()
-    return response["data"]["asks"][0][0]
-
-# === Poslat zprávu na Telegram ===
-def notify_telegram(message):
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+# === Telegram funkce ===
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TG_BOT}/sendMessage"
+    data = {"chat_id": TG_CHAT, "text": message}
+    try:
         requests.post(url, data=data)
+    except Exception as e:
+        print("Telegram error:", e)
 
-# === WEBHOOK ===
-@app.route('/webhook', methods=['POST'])
+# === Globální stav ===
+last_signal = None
+position = None
+entry_price = None
+trailing_stop = None
+
+def get_price():
+    url = f"https://api.mexc.com/api/v3/ticker/price?symbol={SYMBOL.replace('_','')}"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        return float(data["price"])
+    except Exception as e:
+        print("Price error:", e)
+        return None
+
+def mexc_request(method, endpoint, params=None, data=None):
+    url = "https://api.mexc.com" + endpoint
+    headers = {"Content-Type": "application/json"}
+    if params is None: params = {}
+    params['api_key'] = MEXC_API_KEY
+    query = '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
+    sign = hmac.new(MEXC_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    params['sign'] = sign
+    try:
+        if method == "POST":
+            r = requests.post(url, params=params, json=data, headers=headers)
+        else:
+            r = requests.get(url, params=params, headers=headers)
+        return r.json()
+    except Exception as e:
+        print("MEXC API error:", e)
+        return None
+
+def open_position(signal):
+    global position, entry_price, trailing_stop
+    price = get_price()
+    if price is None:
+        send_telegram_message("❗ Nepodařilo se získat cenu BTC.")
+        return
+    side = "BUY" if signal in ["long", "buy"] else "SELL"
+    # --- Demo, místo skutečné objednávky loguje ---
+    send_telegram_message(f"🚀 Otevírám pozici: {side} na {price}\nLeverage: {LEVERAGE}x\nSL: {SL_PERCENT}%\nTrailing: {TRAIL_PERCENT}%")
+    print(f"Open position: {side} {price}")
+    position = side
+    entry_price = price
+    trailing_stop = price * (1 - TRAIL_PERCENT / 100) if side == "BUY" else price * (1 + TRAIL_PERCENT / 100)
+
+def close_position():
+    global position, entry_price, trailing_stop
+    if position:
+        send_telegram_message(f"❌ Pozice uzavřena ({position}).")
+    position = None
+    entry_price = None
+    trailing_stop = None
+
+def price_watcher():
+    global position, entry_price, trailing_stop
+    while True:
+        if position and entry_price:
+            price = get_price()
+            if price:
+                if position == "BUY":
+                    # SL i trailing
+                    new_trailing = max(trailing_stop, price * (1 - TRAIL_PERCENT / 100))
+                    if price <= new_trailing or price <= entry_price * (1 - SL_PERCENT / 100):
+                        send_telegram_message(f"🔔 Trailing nebo SL hitnuto!\nCena: {price}")
+                        close_position()
+                    else:
+                        trailing_stop = new_trailing
+                elif position == "SELL":
+                    new_trailing = min(trailing_stop, price * (1 + TRAIL_PERCENT / 100))
+                    if price >= new_trailing or price >= entry_price * (1 + SL_PERCENT / 100):
+                        send_telegram_message(f"🔔 Trailing nebo SL hitnuto!\nCena: {price}")
+                        close_position()
+                    else:
+                        trailing_stop = new_trailing
+        time.sleep(2)
+
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
-    if not data or "action" not in data:
-        return jsonify({"error": "Chybí akce"}), 400
+    global last_signal
+    data = request.json
+    print("Received:", data)
+    if not data:
+        return jsonify({"error": "No data"}), 400
+    signal = None
+    # Přizpůsob se formátu alertu!
+    if "signal" in data:
+        signal = data["signal"]
+    elif "action" in data:
+        # Pokud používáš "action": "buy" / "sell"
+        signal = data["action"]
 
-    action = data["action"].lower()
-    if action not in ["buy", "sell"]:
-        return jsonify({"error": "Neplatná akce"}), 400
+    if signal:
+        last_signal = signal
+        open_position(signal)
+        return jsonify({"status": "ok"})
+    return jsonify({"error": "Unknown format"}), 400
 
-    result = place_order(action)
-    return jsonify({"status": "obchod odeslán", "výsledek": result})
-
-# === Spuštění ===
-if __name__ == '__main__':
+if __name__ == "__main__":
+    # Start watching price (trailing, SL)
+    t = threading.Thread(target=price_watcher, daemon=True)
+    t.start()
+    send_telegram_message("✅ Bot je online! (MEXC, trailing/SL/Telegram)")
     app.run(host="0.0.0.0", port=10000)
